@@ -443,8 +443,8 @@ def parse_args():
                       "to be searched for in PDB ligands.")
     argp.add_argument('--dryrun', action='store_true', help="Do not read "
                       "any files, but count the number of matches.")
-    argp.add_argument('-t', '--threads', type=int, help="Number of threads "
-                      "on which to run the reading of PDB files.")
+    argp.add_argument('-t', '--threads', type=int, default=1, help="Number "
+                      "of threads on which to run the reading of PDB files.")
     args = argp.parse_args()
     return args
     
