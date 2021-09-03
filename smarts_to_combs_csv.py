@@ -21,7 +21,8 @@ from scipy.spatial.transform import Rotation
 RDLogger.DisableLog('rdApp.*')
 
 def worker(tup):
-    ligpdb, res_cutoff, robs_cutoff, match_mol, smarts_str, ref_coords = tup
+    ligpdb, res_cutoff, robs_cutoff, match_mol, \
+        smarts_str, discard, ref_coords = tup
     try:
         ligpdb.read_pdb()
         if not ligpdb.removed and (ligpdb.resolution > res_cutoff
@@ -29,7 +30,7 @@ def worker(tup):
             return None
         ref_mol = \
             Chem.rdmolops.RemoveHs(match_mol)
-        ligpdb.set_dataframe(smarts_str, ref_coords, ref_mol)
+        ligpdb.set_dataframe(smarts_str, discard, ref_coords, ref_mol)
         return ligpdb.dataframe
     except:
         return None
@@ -69,10 +70,12 @@ class PDBSmarts:
         Write a CSV file for input to COMBS with all PDB matches to a given 
         SMARTS pattern.
     """
-    def __init__(self, smarts, workdir=None, pdb_sdf_path=None, 
-                 lig_list_path=None, pdb_clust_path=None, 
+    def __init__(self, smarts, discard=False, metal=None, workdir=None, 
+                 pdb_sdf_path=None, lig_list_path=None, pdb_clust_path=None, 
                  mirror_path=None, molprobity_path=None):
         self.smarts = smarts
+        self.discard = discard
+        self.metal = metal
         self.workdir = os.getcwd()
         # http://ligand-expo.rcsb.org/dictionaries/cc-to-pdb.tdd
         lig_list = '/home/kormos/thesis_project/pdb_ligands/cc-to-pdb.tdd'
@@ -136,6 +139,11 @@ class PDBSmarts:
                         # get reference coordinates for substructure matching
                         idxs = np.array(mol.GetSubstructMatch(patt))
                         coords = mol.GetConformers()[0].GetPositions()[idxs]
+                        if self.discard:
+                             keep_idxs = [i for i, atom in 
+                                          enumerate(patt.GetAtoms()) 
+                                          if atom.GetAtomicNum() != 0]
+                             coords = coords[keep_idxs]
                         self.ref_coords[smarts_str] = coords
         self._dfs = {}       
 
@@ -151,8 +159,9 @@ class PDBSmarts:
                 print('Example Ligand :', 
                       self.match_mols[smarts_str][0].GetProp("_Name"))
 
-    def read_matches(self, smarts_str, res_cutoff=2., robs_cutoff=0.3, 
-                     molprobity_cutoff=2., threads=1, save_memory=True):
+    def read_matches(self, smarts_str, discard=False, 
+                     res_cutoff=2., robs_cutoff=0.3, molprobity_cutoff=2., 
+                     threads=1, save_memory=True):
         if threads > 1:
             nmols = len(self.match_mols[smarts_str])
             match_mols = \
@@ -165,7 +174,7 @@ class PDBSmarts:
             pool = multiprocessing.Pool(threads)
             self._dfs[smarts_str] = list(pool.imap(worker, 
                 ((match_pdb, res_cutoff, robs_cutoff, match_mol, smarts_str, 
-                ref_coords) for match_pdb, match_mol in 
+                discard, ref_coords) for match_pdb, match_mol in 
                 zip(match_pdbs, match_mols))))
             return
         self._dfs[smarts_str] = []
@@ -219,6 +228,11 @@ class PDBSmarts:
         df = df.drop(['res', 'r_obs'], axis=1).astype({'resnum' : int,
                                                        'cluster' : int, 
                                                        'cluster_rank' : int})
+        csv_name = smarts_str
+        if self.metal:
+            csv_name += '_' + self.metal
+        elif self.discard:
+            csv_name += '_discard_wildcards'
         df.to_csv(self.workdir + '/{}.csv'.format(smarts_str))
 
                 
@@ -302,14 +316,15 @@ class LigandPDB:
         if None in [self.resolution, self.r_obs]:
             self.removed = True
 
-    def set_dataframe(self, smarts, ref_coords=None, ref_mol=None):
+    def set_dataframe(self, smarts, discard=False, ref_coords=None, 
+                      ref_mol=None):
         if self.removed:
             return
         self._set_chains_clusters()
         if not self._resnums:
             self.removed = True
             return
-        self._set_names_coords(smarts, ref_coords, ref_mol)
+        self._set_names_coords(smarts, discard, ref_coords, ref_mol)
         df = {'pdb_accession' : [], 'lig_chain' : [], 
               'prot_chain' : [], 'resnum' : [], 'resname' : [], 
               'name' : [], 'generic_name' : [], 
@@ -382,7 +397,8 @@ class LigandPDB:
             else:
                 self._resnums = [n for n in self._resnums if n != num]
             
-    def _set_names_coords(self, smarts, ref_coords=None, ref_mol=None):
+    def _set_names_coords(self, smarts, discard=False, ref_coords=None, 
+                          ref_mol=None):
         assert self._resnums # must be run after _set_chains_clusters()
         self._names = []
         self._coords = []
@@ -416,32 +432,36 @@ class LigandPDB:
                 self._resnums = [n for n in self._resnums if n != num]
                 continue
             for idxs in idxs_tup:
+                if discard:
+                    keep_idxs = [i for i, atom in enumerate(patt.GetAtoms()) 
+                                 if atom.GetAtomicNum() != 0]
+                    idxs = np.array(idxs)[keep_idxs]
+                else:
+                    idxs = np.array(idxs)
                 pos = mol.GetConformers()[0].GetPositions()
-                n_array = np.array(mol_names)[np.array(idxs)]
-                e_array = np.array(mol_elem)[np.array(idxs)]
+                n_array = np.array(mol_names)[idxs]
+                e_array = np.array(mol_elem)[idxs]
                 # find best alignment of pos to ref_coords
                 if ref_coords is not None:
-                    mean_pos = np.mean(pos[np.array(idxs)], axis=0)
+                    mean_pos = np.mean(pos[idxs], axis=0)
                     mean_ref = np.mean(ref_coords, axis=0)
                     perms = [np.array(p) for p in permute(range(len(idxs)))]
                     min_rmsd = np.inf
                     min_perm = perms[0]
                     for p in perms:
                         if not np.all(e_array[p] == e_array) or \
-                                np.all(pos[np.array(idxs)] - 
-                                ref_coords < 1e-6):
+                                np.all(pos[idxs] - ref_coords < 1e-6):
                             continue
                         rot, rmsd = Rotation.align_vectors(
-                            pos[np.array(idxs)][p] - mean_pos, 
-                            ref_coords - mean_ref)
+                            pos[idxs][p] - mean_pos, ref_coords - mean_ref)
                         if rmsd < min_rmsd:
                             min_rmsd = rmsd
                             min_perm = p
                     self._names.append(list(n_array[min_perm]))
-                    self._coords.append(pos[np.array(idxs)][min_perm])
+                    self._coords.append(pos[idxs][min_perm])
                 else:
                     self._names.append(list(n_array))
-                    self._coords.append(pos[np.array(idxs)])
+                    self._coords.append(pos[idxs])
                     
 
 
@@ -454,16 +474,21 @@ def parse_args():
                       "any files, but count the number of matches.")
     argp.add_argument('-t', '--threads', type=int, default=1, help="Number "
                       "of threads on which to run the reading of PDB files.")
+    argp.add_argument('-d', '--discard', action='store_true', 
+                      help="Discard wildcard atoms in the SMARTS pattern.")
+    argp.add_argument('-m', '--metal', help="PDB two-letter accession code "
+                      "for a metal to be included in the search, if desired.")
     args = argp.parse_args()
     return args
     
 
 if __name__ == "__main__":
     args = parse_args()
-    pdb_smarts = PDBSmarts(args.smarts)
+    pdb_smarts = PDBSmarts(args.smarts, args.discard, args.metal)
     for smarts in pdb_smarts.smarts:
         pdb_smarts.count_pdbs(smarts)
         if not args.dryrun:
-            pdb_smarts.read_matches(smarts, threads=args.threads)
+            pdb_smarts.read_matches(smarts, discard=args.discard, 
+                                    threads=args.threads)
             pdb_smarts.count_pdbs(smarts)
             pdb_smarts.write_combs_csv(smarts)
