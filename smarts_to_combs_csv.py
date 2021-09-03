@@ -1,6 +1,7 @@
 import os
 import sys
 import gzip
+import shutil
 import argparse
 import multiprocessing
 
@@ -81,7 +82,7 @@ class PDBSmarts:
         pdb_clust = '/home/kormos/thesis_project/pdb_seq_clusters/bc-50.out'
         # rsync -rlpt -v -z --delete --port=33444 
         # rsync.rcsb.org::ftp_data/structures/divided/pdb/ <DEST FOLDER>
-        mirror = '/home/kormos/pdb'
+        mirror = '/mnt/d/pdb'
         if workdir:
             self.workdir = workdir
         if lig_list_path:
@@ -146,6 +147,9 @@ class PDBSmarts:
             print('n_pdbs =', 
                   sum([len([p for p in plist if not p.removed]) 
                        for plist in self.match_pdbs[smarts_str]]))
+            if len(self.match_mols[smarts_str]) > 1:
+                print('Example Ligand :', 
+                      self.match_mols[smarts_str][0].GetProp("_Name"))
 
     def read_matches(self, smarts_str, res_cutoff=2., robs_cutoff=0.3, 
                      molprobity_cutoff=2., threads=1, save_memory=True):
@@ -266,6 +270,10 @@ class LigandPDB:
     def read_pdb(self):
         self.pdb_path = self._mirror + '/' + self.id[1:3] + '/pdb' + \
                         self.id + '.ent.gz' 
+        # raw_path = self._mirror + '/' + self.id[1:3] + '/pdb' + \
+        #            self.id + '.ent.gz'
+        # self.pdb_path = os.getcwd() + '/' + self.id + '.ent.gz'
+        # shutil.copy(raw_path, self.pdb_path)
         self._atoms = None
         self._header = None
         self.resolution = None
@@ -276,6 +284,7 @@ class LigandPDB:
         if not os.path.exists(self.pdb_path):
             self.removed = True
             return
+        # os.remove(self.pdb_path)
         self.resolution = self._header['resolution']
         self._atoms = buildBiomolecules(self._header, asym)
         if isinstance(self._atoms, list):
