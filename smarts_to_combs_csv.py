@@ -22,7 +22,7 @@ RDLogger.DisableLog('rdApp.*')
 
 def worker(tup):
     ligpdb, res_cutoff, robs_cutoff, match_mol, \
-        smarts_str, discard, ref_coords = tup
+        smarts_str, discard, metal, ref_coords = tup
     try:
         ligpdb.read_pdb()
         if not ligpdb.removed and (ligpdb.resolution > res_cutoff
@@ -30,7 +30,7 @@ def worker(tup):
             return None
         ref_mol = \
             Chem.rdmolops.RemoveHs(match_mol)
-        ligpdb.set_dataframe(smarts_str, discard, ref_coords, ref_mol)
+        ligpdb.set_dataframe(smarts_str, discard, metal, ref_coords, ref_mol)
         return ligpdb.dataframe
     except:
         return None
@@ -159,7 +159,7 @@ class PDBSmarts:
                 print('Example Ligand :', 
                       self.match_mols[smarts_str][0].GetProp("_Name"))
 
-    def read_matches(self, smarts_str, discard=False, 
+    def read_matches(self, smarts_str, discard=False, metal=None,  
                      res_cutoff=2., robs_cutoff=0.3, molprobity_cutoff=2., 
                      threads=1, save_memory=True):
         if threads > 1:
@@ -174,7 +174,7 @@ class PDBSmarts:
             pool = multiprocessing.Pool(threads)
             self._dfs[smarts_str] = list(pool.imap(worker, 
                 ((match_pdb, res_cutoff, robs_cutoff, match_mol, smarts_str, 
-                discard, ref_coords) for match_pdb, match_mol in 
+                discard, metal, ref_coords) for match_pdb, match_mol in 
                 zip(match_pdbs, match_mols))))
             return
         self._dfs[smarts_str] = []
@@ -233,7 +233,7 @@ class PDBSmarts:
             csv_name += '_' + self.metal
         elif self.discard:
             csv_name += '_discard_wildcards'
-        df.to_csv(self.workdir + '/{}.csv'.format(smarts_str))
+        df.to_csv(self.workdir + '/{}.csv'.format(csv_name))
 
                 
 
@@ -268,7 +268,8 @@ class LigandPDB:
     analyze()
         Identify residue number(s) and chain ID(s) for the ligand(s), as well 
         as chain IDs and homology clusters for contacting protein chains. 
-    set_dataframe(smarts, ref_coords=None, ref_mol=None)
+    set_dataframe(smarts, discard=False, metal=None, 
+                  ref_coords=None, ref_mol=None)
         Generate a COMBS-compatible dataframe containing molecular fragments 
         from the ligand(s) that match a SMARTS pattern as well as optional 
         reference coordinates against which to align by permuting atom order 
@@ -316,11 +317,11 @@ class LigandPDB:
         if None in [self.resolution, self.r_obs]:
             self.removed = True
 
-    def set_dataframe(self, smarts, discard=False, ref_coords=None, 
-                      ref_mol=None):
+    def set_dataframe(self, smarts, discard=False, metal=None, 
+                      ref_coords=None, ref_mol=None):
         if self.removed:
             return
-        self._set_chains_clusters()
+        self._set_chains_clusters(metal)
         if not self._resnums:
             self.removed = True
             return
@@ -348,11 +349,27 @@ class LigandPDB:
                     df['cluster_rank'].append(1) # ranking occurs later
                     df['res'].append(self.resolution)
                     df['r_obs'].append(self.r_obs)
+                if metal is not None:
+                    df['pdb_accession'].append(self.id)
+                    df['lig_chain'].append(self._metal_chains[i])
+                    df['prot_chain'].append(self._prot_chains[i][j])
+                    df['resnum'].append(self._metal_resnums[i])
+                    df['resname'].append(metal)
+                    df['name'].append(metal[0] + metal[1:].lower())
+                    df['generic_name'].append('atom' + 
+                                              str(len(self._names[i])))
+                    df['c_x'].append(self._metal_coords[i][0])
+                    df['c_y'].append(self._metal_coords[i][1])
+                    df['c_z'].append(self._metal_coords[i][2])
+                    df['cluster'].append(self._clusters[i][j])
+                    df['cluster_rank'].append(1) # ranking occurs later
+                    df['res'].append(self.resolution)
+                    df['r_obs'].append(self.r_obs)
         self.dataframe = pd.DataFrame(df)
         # free memory from self._atoms and self._header
         self._atoms, self._header = None, None
 
-    def _set_chains_clusters(self):
+    def _set_chains_clusters(self, metal=None):
         assert self.pdb_path # must be run after read_pdb()
         lig_sel = 'resname {}'.format(self.ligname)
         lig_atoms = self._atoms.select(lig_sel)
@@ -364,18 +381,35 @@ class LigandPDB:
             return
         self._lig_chains = []
         self._lig_segi = []
+        self._metal_resnums = []
+        self._metal_chains = []
+        self._metal_segi = []
+        self._metal_coords = []
         self._prot_chains = []
         self._clusters = []
         with open(self._pdb_clust, 'r') as f:
             lines = f.readlines()
         for num in self._resnums:
             lig_sel = 'resnum {}'.format(num)
-            prot_sel = 'protein within 5 of ' + lig_sel
-            if lig_sel is not None and prot_sel is not None:
-                lig_atoms = self._atoms.select(lig_sel)
-                prot_atoms = self._atoms.select(prot_sel)
-            else: 
-                self._resnums = [n for n in self._resnums if n != num]
+            lig_atoms = self._atoms.select(lig_sel)
+            prot_sel = 'protein within 5 of ({})'
+            if metal:
+                metal_sel = 'resname {} within 5 of '.format(metal) + lig_sel
+                metal_atom = list(self._atoms.select(metal_sel))[0]
+                if metal_atom:
+                    metal_num = metal_atom.getResnum()
+                    self._metal_resnums.append(metal_num)
+                    self._metal_chains.append(metal_atom.getChid())
+                    self._metal_segi.append(metal_atom.getSegindex())
+                    self._metal_coords.append(metal_atom.getCoords())
+                    prot_sel.format(ligand_sel + 
+                                    ' or resnum {}'.format(metal_num))
+                else:
+                    self._resnums = [n for n in self._resnums if n != num]
+                    continue
+            else:
+                prot_sel.format(lig_sel)
+            prot_atoms = self._atoms.select(prot_sel)
             if prot_atoms:
                 self._lig_chains.append([a.getChid() for a in lig_atoms][0])
                 self._lig_segi.append([a.getSegindex() for a in lig_atoms][0])
@@ -396,6 +430,7 @@ class LigandPDB:
                                                  if c != chain]
             else:
                 self._resnums = [n for n in self._resnums if n != num]
+        self._metal_coords = np.array(self._metal_coords)
             
     def _set_names_coords(self, smarts, discard=False, ref_coords=None, 
                           ref_mol=None):
@@ -461,8 +496,7 @@ class LigandPDB:
                     self._coords.append(pos[idxs][min_perm])
                 else:
                     self._names.append(list(n_array))
-                    self._coords.append(pos[idxs])
-                    
+                    self._coords.append(pos[idxs]) 
 
 
 def parse_args():
@@ -489,6 +523,6 @@ if __name__ == "__main__":
         pdb_smarts.count_pdbs(smarts)
         if not args.dryrun:
             pdb_smarts.read_matches(smarts, discard=args.discard, 
-                                    threads=args.threads)
+                                    metal=args.metal, threads=args.threads)
             pdb_smarts.count_pdbs(smarts)
             pdb_smarts.write_combs_csv(smarts)
