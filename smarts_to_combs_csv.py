@@ -78,14 +78,14 @@ class PDBSmarts:
         self.metal = metal
         self.workdir = os.getcwd()
         # http://ligand-expo.rcsb.org/dictionaries/cc-to-pdb.tdd
-        lig_list = '/home/kormos/thesis_project/pdb_ligands/cc-to-pdb.tdd'
+        lig_list = '/Users/kormos/smarts_to_combs_csv/cc-to-pdb.tdd'
         # http://ligand-expo.rcsb.org/dictionaries/Components-pub.sdf
-        pdb_sdf = '/home/kormos/thesis_project/pdb_ligands/Components-pub.sdf'
+        pdb_sdf = '/Users/kormos/smarts_to_combs_csv/Components-pub.sdf'
         # https://cdn.rcsb.org/resources/sequence/clusters/bc-50.out
-        pdb_clust = '/home/kormos/thesis_project/pdb_seq_clusters/bc-50.out'
+        pdb_clust = '/Users/kormos/smarts_to_combs_csv/bc-50.out'
         # rsync -rlpt -v -z --delete --port=33444 
         # rsync.rcsb.org::ftp_data/structures/divided/pdb/ <DEST FOLDER>
-        mirror = '/mnt/d/pdb'
+        mirror = '/Users/kormos/pdb'
         if workdir:
             self.workdir = workdir
         if lig_list_path:
@@ -355,7 +355,7 @@ class LigandPDB:
                     df['prot_chain'].append(self._prot_chains[i][j])
                     df['resnum'].append(self._metal_resnums[i])
                     df['resname'].append(metal)
-                    df['name'].append(metal[0] + metal[1:].lower())
+                    df['name'].append(metal)
                     df['generic_name'].append('atom' + 
                                               str(len(self._names[i])))
                     df['c_x'].append(self._metal_coords[i][0])
@@ -392,24 +392,25 @@ class LigandPDB:
         for num in self._resnums:
             lig_sel = 'resnum {}'.format(num)
             lig_atoms = self._atoms.select(lig_sel)
-            prot_sel = 'protein within 5 of ({})'
+            prot_sel = 'protein within 5 of ' + lig_sel
             if metal:
                 metal_sel = 'resname {} within 5 of '.format(metal) + lig_sel
                 metal_atom = list(self._atoms.select(metal_sel))[0]
                 if metal_atom:
                     metal_num = metal_atom.getResnum()
-                    self._metal_resnums.append(metal_num)
-                    self._metal_chains.append(metal_atom.getChid())
-                    self._metal_segi.append(metal_atom.getSegindex())
-                    self._metal_coords.append(metal_atom.getCoords())
-                    prot_sel.format(ligand_sel + 
-                                    ' or resnum {}'.format(metal_num))
+                    prot_sel += ' and protein within 5 of resnum {}'.format(
+                        metal_num)
+                    prot_atoms = self._atoms.select(prot_sel)
+                    if prot_atoms:
+                        self._metal_resnums.append(metal_num)
+                        self._metal_chains.append(metal_atom.getChid())
+                        self._metal_segi.append(metal_atom.getSegindex())
+                        self._metal_coords.append(metal_atom.getCoords())
                 else:
                     self._resnums = [n for n in self._resnums if n != num]
                     continue
             else:
-                prot_sel.format(lig_sel)
-            prot_atoms = self._atoms.select(prot_sel)
+                prot_atoms = self._atoms.select(prot_sel)
             if prot_atoms:
                 self._lig_chains.append([a.getChid() for a in lig_atoms][0])
                 self._lig_segi.append([a.getSegindex() for a in lig_atoms][0])
