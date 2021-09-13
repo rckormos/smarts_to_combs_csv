@@ -233,6 +233,8 @@ class PDBSmarts:
             csv_name += '_' + self.metal
         elif self.discard:
             csv_name += '_discard_wildcards'
+        csv_name.replace('/', '')
+        csv_name.replace('\\', '')
         df.to_csv(self.workdir + '/{}.csv'.format(csv_name))
 
                 
@@ -285,10 +287,6 @@ class LigandPDB:
     def read_pdb(self):
         self.pdb_path = self._mirror + '/' + self.id[1:3] + '/pdb' + \
                         self.id + '.ent.gz' 
-        # raw_path = self._mirror + '/' + self.id[1:3] + '/pdb' + \
-        #            self.id + '.ent.gz'
-        # self.pdb_path = os.getcwd() + '/' + self.id + '.ent.gz'
-        # shutil.copy(raw_path, self.pdb_path)
         self._atoms = None
         self._header = None
         self.resolution = None
@@ -299,7 +297,6 @@ class LigandPDB:
         if not os.path.exists(self.pdb_path):
             self.removed = True
             return
-        # os.remove(self.pdb_path)
         self.resolution = self._header['resolution']
         self._atoms = buildBiomolecules(self._header, asym)
         if isinstance(self._atoms, list):
@@ -337,7 +334,9 @@ class LigandPDB:
                 for k in range(len(self._names[i])):
                     df['pdb_accession'].append(self.id)
                     df['lig_chain'].append(self._lig_chains[i])
+                    df['lig_segi'].append(self._lig_segi[i])
                     df['prot_chain'].append(self._prot_chains[i][j])
+                    df['prot_segi'].append(self._prot_segi[i][j])
                     df['resnum'].append(self._resnums[i])
                     df['resname'].append(self.ligname)
                     df['name'].append(self._names[i][k])
@@ -352,7 +351,9 @@ class LigandPDB:
                 if metal is not None:
                     df['pdb_accession'].append(self.id)
                     df['lig_chain'].append(self._metal_chains[i])
+                    df['lig_segi'].append(self._metal_segi[i])
                     df['prot_chain'].append(self._prot_chains[i][j])
+                    df['prot_segi'].append(self._prot_segi[i][j])
                     df['resnum'].append(self._metal_resnums[i])
                     df['resname'].append(metal)
                     df['name'].append(metal[0] + metal[1:].lower())
@@ -386,6 +387,7 @@ class LigandPDB:
         self._metal_segi = []
         self._metal_coords = []
         self._prot_chains = []
+        self._prot_segi = []
         self._clusters = []
         with open(self._pdb_clust, 'r') as f:
             lines = f.readlines()
@@ -415,6 +417,8 @@ class LigandPDB:
                 self._lig_segi.append([a.getSegindex() for a in lig_atoms][0])
                 self._prot_chains.append(list(set([a.getChid() 
                                                    for a in prot_atoms])))
+                self._prot_segi.append(list(set([a.getSegindex() 
+                                                 for a in prot_atoms])))
                 self._clusters.append([])
                 for chain in self._prot_chains[-1]:
                     full_id = self.id.upper() + '_' + chain
@@ -425,9 +429,10 @@ class LigandPDB:
                     if True in has_id:
                         self._clusters[-1].append(has_id.index(True))
                     else:
-                        self._prot_chains[-1] = [c for c in 
-                                                 self._prot_chains[-1] 
-                                                 if c != chain]
+                        self._prot_chains[-1], self._prot_segi[-1] = \
+                            zip(*[(c, s) for c, s in 
+                                  zip(self._prot_chains[-1], 
+                                      self._prot_segi[-1]) if c != chain])
             else:
                 self._resnums = [n for n in self._resnums if n != num]
         self._metal_coords = np.array(self._metal_coords)
