@@ -23,17 +23,14 @@ RDLogger.DisableLog('rdApp.*')
 def worker(tup):
     ligpdb, res_cutoff, robs_cutoff, match_mol, \
         smarts_str, discard, metal, ref_coords = tup
-    try:
-        ligpdb.read_pdb()
-        if not ligpdb.removed and (ligpdb.resolution > res_cutoff
-                or ligpdb.r_obs > robs_cutoff):
-            return None
-        ref_mol = \
-            Chem.rdmolops.RemoveHs(match_mol)
-        ligpdb.set_dataframe(smarts_str, discard, metal, ref_coords, ref_mol)
-        return ligpdb.dataframe
-    except:
+    ligpdb.read_pdb()
+    if not ligpdb.removed and (ligpdb.resolution > res_cutoff
+            or ligpdb.r_obs > robs_cutoff):
         return None
+    ref_mol = \
+        Chem.rdmolops.RemoveHs(match_mol)
+    ligpdb.set_dataframe(smarts_str, discard, metal, ref_coords, ref_mol)
+    return ligpdb.dataframe
 
 class PDBSmarts:
     """
@@ -109,13 +106,11 @@ class PDBSmarts:
         names = []
         pdbs = []
         for mol in suppl:
-            try:
+            if mol is not None:
                 Chem.SanitizeMol(mol)
                 if mol.GetProp("_Name") in list_names:
                     names.append(mol.GetProp("_Name"))
                     mols.append(mol)
-            except:
-                pass
         # get list of PDBs containing each ligand in dict form
         pdbs = dict([(lig, plist.split()) for lig, plist in 
                      [line.split('\t') for line in lines] 
@@ -162,50 +157,34 @@ class PDBSmarts:
     def read_matches(self, smarts_str, discard=False, metal=None,  
                      res_cutoff=2., robs_cutoff=0.3, molprobity_cutoff=2., 
                      threads=1, save_memory=True):
+        nmols = len(self.match_mols[smarts_str])
+        match_mols = \
+            iterchain.from_iterable([[self.match_mols[smarts_str][i]] * 
+                                     len(self.match_pdbs[smarts_str][i]) 
+                                     for i in range(nmols)])
+        match_pdbs = \
+            iterchain.from_iterable(self.match_pdbs[smarts_str])
+        ref_coords = self.ref_coords[smarts_str]
         if threads > 1:
-            nmols = len(self.match_mols[smarts_str])
-            match_mols = \
-                iterchain.from_iterable([[self.match_mols[smarts_str][i]] * 
-                                         len(self.match_pdbs[smarts_str][i]) 
-                                         for i in range(nmols)])
-            match_pdbs = \
-                iterchain.from_iterable(self.match_pdbs[smarts_str])
-            ref_coords = self.ref_coords[smarts_str]
             pool = multiprocessing.Pool(threads)
             self._dfs[smarts_str] = list(pool.imap(worker, 
                 ((match_pdb, res_cutoff, robs_cutoff, match_mol, smarts_str, 
                 discard, metal, ref_coords) for match_pdb, match_mol in 
                 zip(match_pdbs, match_mols))))
-            return
-        self._dfs[smarts_str] = []
-        for i, plist in enumerate(self.match_pdbs[smarts_str]):
-            plist = self.match_pdbs[smarts_str][i]
-            for j, ligpdb in enumerate(plist):
-                if ligpdb.removed and save_memory:
-                    self.match_pdbs[smarts_str][i][j] = None
-                try:
-                    ligpdb.read_pdb()
-                    if not ligpdb.removed and (ligpdb.resolution > res_cutoff
-                            or ligpdb.r_obs > robs_cutoff):
-                        ligpdb.removed = True
-                        if save_memory:
-                            self.match_pdbs[smarts_str][i][j] = None
-                        continue
-                    ref_mol = \
-                        Chem.rdmolops.RemoveHs(self.match_mols[smarts_str][i])
-                    ligpdb.set_dataframe(smarts_str, 
-                                         self.ref_coords[smarts_str], ref_mol)
-                except:
-                    ligpdb.removed = True
-                    if save_memory:
-                        self.match_pdbs[smarts_str][i][j] = None
-                if not ligpdb.removed:
-                    self._dfs[smarts_str].append(ligpdb.dataframe)
-                    if save_memory:
-                        self.match_pdbs[smarts_str][i][j] = None
+        else:
+            self._dfs[smarts_str] = []
+            for match_pdb, match_mol in zip(match_pdbs, match_mols):
+                self._dfs[smarts_str].append(worker((match_pdb, res_cutoff, 
+                                                     robs_cutoff, match_mol, 
+                                                     smarts_str, discard, 
+                                                     metal, ref_coords)))
 
     def write_combs_csv(self, smarts_str, res_quotient=2., robs_quotient=0.3):
-        df = pd.concat([df for df in self._dfs[smarts_str] if df is not None])
+        all_dfs = [df for df in self._dfs[smarts_str] if df is not None]
+        if len(all_dfs):
+            df = pd.concat(all_dfs)
+        else:
+            return
         # rank homologous chains before outputting CSV
         clusters = set(df['cluster'])
         for cluster in clusters:
@@ -225,11 +204,14 @@ class PDBSmarts:
                    df.loc[(df.pdb_accession == struct) & 
                           (df.cluster == cluster), "cluster_rank"] = rank
         # output final CSV
-        df = df.drop(['res', 'r_obs'], axis=1).astype({'resnum' : int,
+        df = df.drop(['res', 'r_obs'], axis=1).astype({'lig_segi' : int,
+                                                       'prot_segi' : int,
+                                                       'resnum' : int,
                                                        'cluster' : int, 
                                                        'cluster_rank' : int})
         csv_name = smarts_str
         if self.metal:
+            df = df.astype({'metal_segi' : int})
             csv_name += '_' + self.metal
         elif self.discard:
             csv_name += '_discard_wildcards'
@@ -291,13 +273,14 @@ class LigandPDB:
         self._header = None
         self.resolution = None
         self.r_obs = None
-        asym, self._header = parsePDB(self.pdb_path, header=True)
-        with gzip.open(self.pdb_path, 'rt') as f:
-            lines = f.read().split('\n')
         if not os.path.exists(self.pdb_path):
             self.removed = True
             return
-        self.resolution = self._header['resolution']
+        asym, self._header = parsePDB(self.pdb_path, header=True)
+        with gzip.open(self.pdb_path, 'rt') as f:
+            lines = f.read().split('\n')
+        if 'resolution' in self._header.keys():
+            self.resolution = self._header['resolution']
         self._atoms = buildBiomolecules(self._header, asym)
         if isinstance(self._atoms, list):
             for biol in self._atoms:
@@ -309,23 +292,26 @@ class LigandPDB:
                 return
         for line in lines:
             if not self.r_obs and 'REMARK   3   R VALUE' in line:
-                self.r_obs = float([val for val in line.split() 
-                                    if val != ''][-1])
+                r_obs_str = [val for val in line.split() if val != ''][-1]
+                if set('.123456789').intersection(r_obs_str):
+                    self.r_obs = float(r_obs_str)
         if None in [self.resolution, self.r_obs]:
             self.removed = True
 
     def set_dataframe(self, smarts, discard=False, metal=None, 
                       ref_coords=None, ref_mol=None):
         if self.removed:
+            self.dataframe = None
             return
         self._set_chains_clusters(metal)
         if not self._resnums:
+            self.dataframe = None
             self.removed = True
             return
         self._set_names_coords(smarts, discard, ref_coords, ref_mol)
-        df = {'pdb_accession' : [], 'lig_chain' : [], 
-              'prot_chain' : [], 'resnum' : [], 'resname' : [], 
-              'name' : [], 'generic_name' : [], 
+        df = {'pdb_accession' : [], 'lig_chain' : [], 'lig_segi' : [],  
+              'prot_chain' : [], 'prot_segi' : [], 'resnum' : [], 
+              'resname' : [], 'name' : [], 'generic_name' : [], 
               'c_x' : [], 'c_y' : [], 'c_z' : [], 
               'cluster' : [], 'cluster_rank' : [], 
               'res' : [], 'r_obs' : []}
@@ -416,10 +402,11 @@ class LigandPDB:
             if prot_atoms:
                 self._lig_chains.append([a.getChid() for a in lig_atoms][0])
                 self._lig_segi.append([a.getSegindex() for a in lig_atoms][0])
-                self._prot_chains.append(list(set([a.getChid() 
-                                                   for a in prot_atoms])))
-                self._prot_segi.append(list(set([a.getSegindex() 
-                                                 for a in prot_atoms])))
+                all_chains = [a.getChid() for a in prot_atoms]
+                all_segi = [a.getSegindex() for a in prot_atoms]
+                self._prot_chains.append(list(set(all_chains)))
+                self._prot_segi.append([all_segi[all_chains.index(chid)] 
+                                        for chid in set(all_chains)])
                 self._clusters.append([])
                 for chain in self._prot_chains[-1]:
                     full_id = self.id.upper() + '_' + chain
@@ -430,10 +417,14 @@ class LigandPDB:
                     if True in has_id:
                         self._clusters[-1].append(has_id.index(True))
                     else:
-                        self._prot_chains[-1], self._prot_segi[-1] = \
-                            zip(*[(c, s) for c, s in 
-                                  zip(self._prot_chains[-1], 
-                                      self._prot_segi[-1]) if c != chain])
+                        tups = [(c, s) for c, s in 
+                                zip(self._prot_chains[-1], 
+                                    self._prot_segi[-1]) if c != chain]
+                        if len(tups):
+                            self._prot_chains[-1], self._prot_segi[-1] = \
+                            zip(*tups)
+                        else:
+                            self._prot_chains[-1], self._prot_segi[-1] = [], []
             else:
                 self._resnums = [n for n in self._resnums if n != num]
         self._metal_coords = np.array(self._metal_coords)
@@ -448,21 +439,24 @@ class LigandPDB:
             sel = self._atoms.select(selstr.format(num, self.ligname, 
                                                    self._lig_chains[i], 
                                                    self._lig_segi[i]))
+            if not sel:
+                self._resnums = [n for n in self._resnums if n != num]
+                continue
             # read ligand into RDKit
             pdbio = StringIO()
             writePDBStream(pdbio, sel)
             block = pdbio.getvalue()
             # not all ligands have hydrogen, so MolFromPDBBlock removes any H 
             # if it happens to be present, and then H is added back by RDKit
+            mol = Chem.rdmolfiles.MolFromPDBBlock(block)
             try:
-                mol = Chem.rdmolfiles.MolFromPDBBlock(block)
                 if ref_mol is not None and mol.GetNumAtoms() == \
                         ref_mol.GetNumAtoms():
-                    mol = AllChem.AssignBondOrdersFromTemplate(ref_mol, mol) 
-                mol = Chem.rdmolops.AddHs(mol, addCoords=True)
+                    mol = AllChem.AssignBondOrdersFromTemplate(ref_mol, mol)
             except:
                 self._resnums = [n for n in self._resnums if n != num]
                 continue
+            mol = Chem.rdmolops.AddHs(mol, addCoords=True)
             mol_names = []
             for line in Chem.rdmolfiles.MolToPDBBlock(mol).split('\n'):
                 mol_names.append(line[12:16].strip())
