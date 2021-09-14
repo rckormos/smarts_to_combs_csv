@@ -1,4 +1,4 @@
-import sys
+import argparse
 import numpy as np
 import pandas as pd
 
@@ -62,8 +62,16 @@ def cluster_greedy(dists, threshold=0.25):
             clusters.append(cluster)
     return clusters
 
+def parse_args():
+    argp = argparse.ArgumentParser()
+    argp.add_argument('csv', help="CSV to cluster.")
+    argp.add_argument('-t', '--threshold', type=float, default=0.25, 
+                      help="Clusrering threshold (in Angstroms).")
+    return argp.parse_args()
+
 if __name__ == "__main__":
-    csv_in = sys.argv[1]
+    args = parse_args()
+    csv_in = args.csv
     df = pd.read_csv(csv_in)
     N = len(set(df['generic_name']))
     pos = np.array(df[['c_x', 'c_y', 'c_z']]).reshape((-1, N, 3))
@@ -79,10 +87,7 @@ if __name__ == "__main__":
     # coords_align, rmsds = transform_coords(pos[idxs0], pos[idxs1])
     rmsds_array = np.zeros((M, M))
     rmsds_array[idxs0, idxs1], rmsds_array[idxs1, idxs0] = rmsds, rmsds
-    if len(sys.argv) > 2:
-        clusters = cluster_greedy(rmsds_array, float(sys.argv[2]))
-    else:
-        clusters = cluster_greedy(rmsds_array)
+    clusters = cluster_greedy(rmsds_array, args.threshold)
     for i, cluster in enumerate(clusters):
         cluster_idxs = np.zeros(len(cluster) * N, dtype=int)
         for j in range(N):
