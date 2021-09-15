@@ -22,14 +22,15 @@ RDLogger.DisableLog('rdApp.*')
 
 def worker(tup):
     ligpdb, res_cutoff, robs_cutoff, match_mol, \
-        smarts_str, discard, metals, ref_coords = tup
+        smarts_str, discard, metals, ref_coords, perms = tup
     ligpdb.read_pdb()
     if not ligpdb.removed and (ligpdb.resolution > res_cutoff
             or ligpdb.r_obs > robs_cutoff):
         return None
     ref_mol = \
         Chem.rdmolops.RemoveHs(match_mol)
-    ligpdb.set_dataframe(smarts_str, discard, metals, ref_coords, ref_mol)
+    ligpdb.set_dataframe(smarts_str, discard, metals, 
+                         ref_coords, ref_mol, perms)
     return ligpdb.dataframe
 
 class PDBSmarts:
@@ -119,6 +120,7 @@ class PDBSmarts:
         self.match_mols = {}
         self.match_pdbs = {}
         self.ref_coords = {}
+        self._perms = {}
         for smarts_str in self.smarts:
             patt = Chem.MolFromSmarts(smarts_str)
             self.match_mols[smarts_str] = []
@@ -140,6 +142,17 @@ class PDBSmarts:
                                           if atom.GetAtomicNum() != 0]
                              coords = coords[keep_idxs]
                         self.ref_coords[smarts_str] = coords
+            # get symmetry-equivalent permutations of atoms in patt
+            n_atoms = patt.GetNumAtoms()
+            patt.UpdatePropertyCache()
+            sym_classes = np.array(Chem.CanonicalRankAtoms(patt, 
+                                                           breakTies=False))
+            dt = np.dtype([('', np.int64)] * n_atoms)
+            perms = np.fromiter(permute(np.arange(n_atoms)), 
+		                dt).view(np.int64).reshape(-1, n_atoms)
+            sym_perms = sym_classes[perms]
+            self._perms[smarts_str] = \
+                perms[np.all(sym_perms == sym_perms[0], axis=1)]
         self._dfs = {}       
 
     def count_pdbs(self, smarts_str):
@@ -169,15 +182,16 @@ class PDBSmarts:
             pool = multiprocessing.Pool(threads)
             self._dfs[smarts_str] = list(pool.imap(worker, 
                 ((match_pdb, res_cutoff, robs_cutoff, match_mol, smarts_str, 
-                discard, metals, ref_coords) for match_pdb, match_mol in 
-                zip(match_pdbs, match_mols))))
+                discard, metals, ref_coords, self._perms[smarts_str]) 
+                for match_pdb, match_mol in zip(match_pdbs, match_mols))))
         else:
             self._dfs[smarts_str] = []
             for match_pdb, match_mol in zip(match_pdbs, match_mols):
                 self._dfs[smarts_str].append(worker((match_pdb, res_cutoff, 
                                                      robs_cutoff, match_mol, 
                                                      smarts_str, discard, 
-                                                     metals, ref_coords)))
+                                                     metals, ref_coords, 
+                                                     self._perms[smarts_str])))
 
     def write_combs_csv(self, smarts_str, res_quotient=2., robs_quotient=0.3):
         all_dfs = [df for df in self._dfs[smarts_str] if df is not None]
@@ -302,7 +316,7 @@ class LigandPDB:
             self.removed = True
 
     def set_dataframe(self, smarts, discard=False, metals=None, 
-                      ref_coords=None, ref_mol=None):
+                      ref_coords=None, ref_mol=None, perms=None):
         if self.removed:
             self.dataframe = None
             return
@@ -311,7 +325,7 @@ class LigandPDB:
             self.dataframe = None
             self.removed = True
             return
-        self._set_names_coords(smarts, discard, ref_coords, ref_mol)
+        self._set_names_coords(smarts, discard, ref_coords, ref_mol, perms)
         df = {'pdb_accession' : [], 'lig_chain' : [], 'lig_segi' : [],  
               'prot_chain' : [], 'prot_segi' : [], 'resnum' : [], 
               'resname' : [], 'name' : [], 'generic_name' : [], 
@@ -442,7 +456,7 @@ class LigandPDB:
         self._metal_coords = np.array(self._metal_coords)
             
     def _set_names_coords(self, smarts, discard=False, ref_coords=None, 
-                          ref_mol=None):
+                          ref_mol=None, perms=None):
         assert self._resnums # must be run after _set_chains_clusters()
         self._names = []
         self._coords = []
@@ -472,7 +486,6 @@ class LigandPDB:
             mol_names = []
             for line in Chem.rdmolfiles.MolToPDBBlock(mol).split('\n'):
                 mol_names.append(line[12:16].strip())
-            mol_elem = [a.GetSymbol() for a in mol.GetAtoms()]
             patt = Chem.MolFromSmarts(smarts)
             idxs_tup = mol.GetSubstructMatches(patt)
             if not idxs_tup:
@@ -480,25 +493,20 @@ class LigandPDB:
                 continue
             for idxs in idxs_tup:
                 if discard:
-                    keep_idxs = [i for i, atom in enumerate(patt.GetAtoms()) 
+                    keep_idxs = [i for i, atom in enumerate(patt.GetAtoms())
                                  if atom.GetAtomicNum() != 0]
                     idxs = np.array(idxs)[keep_idxs]
                 else:
                     idxs = np.array(idxs)
                 pos = mol.GetConformers()[0].GetPositions()
                 n_array = np.array(mol_names)[idxs]
-                e_array = np.array(mol_elem)[idxs]
                 # find best alignment of pos to ref_coords
-                if ref_coords is not None:
+                if ref_coords is not None and perms is not None:
                     mean_pos = np.mean(pos[idxs], axis=0)
                     mean_ref = np.mean(ref_coords, axis=0)
-                    perms = [np.array(p) for p in permute(range(len(idxs)))]
                     min_rmsd = np.inf
                     min_perm = perms[0]
                     for p in perms:
-                        if not np.all(e_array[p] == e_array) or \
-                                np.all(pos[idxs] - ref_coords < 1e-6):
-                            continue
                         rot, rmsd = Rotation.align_vectors(
                             pos[idxs][p] - mean_pos, ref_coords - mean_ref)
                         if rmsd < min_rmsd:
