@@ -14,6 +14,8 @@ import pandas as pd
 
 from rdkit import Chem
 from rdkit.Chem import AllChem
+from rdkit.Chem.Descriptors import ExactMolWt
+from rdkit.DataStructs import FingerprintSimilarity
 from rdkit import RDLogger
 from prody import *
 from scipy.spatial.transform import Rotation
@@ -69,6 +71,7 @@ class PDBSmarts:
         SMARTS pattern.
     """
     def __init__(self, smarts, discard=False, metals=None, workdir=None, 
+                 lig_weight_limit=1000, tanimoto_threshold=0.8, 
                  pdb_sdf_path=None, lig_list_path=None, pdb_clust_path=None, 
                  mirror_path=None, molprobity_path=None):
         self.smarts = smarts
@@ -109,7 +112,8 @@ class PDBSmarts:
         for mol in suppl:
             if mol is not None:
                 Chem.SanitizeMol(mol)
-                if mol.GetProp("_Name") in list_names:
+                if mol.GetProp("_Name") in list_names and \
+                        ExactMolWt(mol) < lig_weight_limit:
                     names.append(mol.GetProp("_Name"))
                     mols.append(mol)
         # get list of PDBs containing each ligand in dict form
@@ -121,6 +125,7 @@ class PDBSmarts:
         self.match_pdbs = {}
         self.ref_coords = {}
         self._perms = {}
+        self._tanimoto_clusters = {}
         for smarts_str in self.smarts:
             patt = Chem.MolFromSmarts(smarts_str)
             self.match_mols[smarts_str] = []
@@ -142,6 +147,8 @@ class PDBSmarts:
                                           if atom.GetAtomicNum() != 0]
                              coords = coords[keep_idxs]
                         self.ref_coords[smarts_str] = coords
+            # get tanimoto clusters of ligands
+            self.set_tanimoto_clusters(smarts_str, tanimoto_threshold)
             # get symmetry-equivalent permutations of atoms in patt
             n_atoms = patt.GetNumAtoms()
             patt.UpdatePropertyCache()
@@ -153,9 +160,17 @@ class PDBSmarts:
             sym_perms = sym_classes[perms]
             self._perms[smarts_str] = \
                 perms[np.all(sym_perms == sym_perms[0], axis=1)]
-        self._dfs = {}       
+        self._dfs = {}
+        self._final_df = {}
 
     def count_pdbs(self, smarts_str):
+        if smarts_str not in self._final_df.keys():
+            print('n_ligands =', len(self.match_mols[smarts_str]))
+        else:
+            long_df = self._final_df[smarts_str]
+            short_df = long_df[long_df['lig_cluster_rank'] == 1]
+            print('n_ligands =', len(set(long_df['resname'])))
+            print('n_dissimilar_ligands =', len(set(short_df['resname'])))
         if smarts_str in self._dfs.keys():
             print('n_pdbs =', len([ent for ent in self._dfs[smarts_str] 
                                    if ent is not None]))
@@ -217,6 +232,24 @@ class PDBSmarts:
                for struct, rank in zip(structs, ranks):
                    df.loc[(df.pdb_accession == struct) & 
                           (df.cluster == cluster), "cluster_rank"] = rank
+        # rank tanimoto-similar ligands before outputting CSV
+        final_ligs = set(df['resname'])
+        self._tanimoto_clusters[smarts_str] = \
+            [[lig for lig in cluster if lig in final_ligs] for cluster 
+             in self._tanimoto_clusters[smarts_str] 
+             if len(final_ligs.intersection(cluster)) > 0]
+        lig_clusters = {}
+        lig_cluster_ranks = {}
+        for lig in final_ligs:
+            c_id = [i for i, cluster in 
+                    enumerate(self._tanimoto_clusters[smarts_str]) 
+                    if lig in cluster][0]
+            lig_clusters[lig] = c_id + 1
+            lig_cluster_ranks[lig] = \
+                self._tanimoto_clusters[smarts_str][c_id].index(lig) + 1
+        df['lig_cluster'] = [lig_clusters[lig] for lig in df['resname']]
+        df['lig_cluster_rank'] = [lig_cluster_ranks[lig] for lig in 
+                                  df['resname']]
         # output final CSV
         df = df.drop(['res', 'r_obs'], axis=1).astype({'lig_segi' : int,
                                                        'prot_segi' : int,
@@ -231,6 +264,35 @@ class PDBSmarts:
         csv_name.replace('/', '')
         csv_name.replace('\\', '')
         df.to_csv(self.workdir + '/{}.csv'.format(csv_name))
+        self._final_df[smarts_str] = df
+
+    def set_tanimoto_clusters(self, smarts_str, tanimoto_threshold):
+        names = [mol.GetProp("_Name") for mol in self.match_mols[smarts_str]]
+        if tanimoto_threshold == 1.:
+            self._tanimoto_clusters[smarts_str] = [[name] for name in names]
+            return
+        self._tanimoto_clusters[smarts_str] = [] 
+        nmols = len(self.match_mols[smarts_str])
+        print('Getting fingerprints.')
+        fingerprints = [Chem.RDKFingerprint(mol) for mol in 
+                        self.match_mols[smarts_str]]
+        sim_array = np.ones((nmols, nmols))
+        print('Computing pairwise Tanimoto scores.')
+        for i, j in zip(*np.triu_indices(nmols, 1)):
+            sim = FingerprintSimilarity(fingerprints[i], fingerprints[j])
+            sim_array[i, j], sim_array[j, i] = sim, sim
+        print('Clustering by Tanimoto score.')
+        # greedily cluster ligands by tanimoto score
+        gt_thresh = (sim_array > tanimoto_threshold).astype(int)
+        n_neighbors = np.sum(gt_thresh, axis=0) - 1
+        clustered = np.zeros(nmols).astype(bool)
+        for i in np.argsort(n_neighbors)[::-1]:
+            if not clustered[i]:
+                cluster = np.argwhere(np.logical_and(gt_thresh[i], 
+                                                     ~clustered)).flatten()
+                clustered[cluster] = True
+                cluster_names = [names[i] for i in cluster]
+                self._tanimoto_clusters[smarts_str].append(cluster_names)
 
                 
 
@@ -498,7 +560,7 @@ class LigandPDB:
                     idxs = np.array(idxs)[keep_idxs]
                 else:
                     idxs = np.array(idxs)
-                pos = mol.GetConformers()[0].GetPositions()
+                pos = np.round(mol.GetConformers()[0].GetPositions(), 3)
                 n_array = np.array(mol_names)[idxs]
                 # find best alignment of pos to ref_coords
                 if ref_coords is not None and perms is not None:
@@ -533,17 +595,23 @@ def parse_args():
     argp.add_argument('-m', '--metals', nargs='+', help="PDB two-letter "
                       "accession code(s) for possible metals to be included "
                       "in the search as a single extra atom, if desired.")
+    argp.add_argument('-w', '--weight-limit', type=float, default=1000., 
+                      help="Molecular weight limit on ligands to consider. "
+                      "(Default: 1000 Daltons)")
+    argp.add_argument('--tanimoto', type=float, default=1., 
+                      help="Cluster threshold by which to cluster ligands.")
     args = argp.parse_args()
     return args
     
 
 if __name__ == "__main__":
     args = parse_args()
-    pdb_smarts = PDBSmarts(args.smarts, args.discard, args.metals)
+    pdb_smarts = PDBSmarts(args.smarts, args.discard, args.metals, None,  
+                           args.weight_limit, args.tanimoto)
     for smarts in pdb_smarts.smarts:
         pdb_smarts.count_pdbs(smarts)
         if not args.dryrun:
             pdb_smarts.read_matches(smarts, discard=args.discard, 
                                     metals=args.metals, threads=args.threads)
-            pdb_smarts.count_pdbs(smarts)
             pdb_smarts.write_combs_csv(smarts)
+            pdb_smarts.count_pdbs(smarts)
