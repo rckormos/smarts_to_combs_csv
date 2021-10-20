@@ -72,8 +72,9 @@ class PDBSmarts:
     """
     def __init__(self, smarts, discard=False, metals=None, workdir=None, 
                  lig_weight_limit=1000, tanimoto_threshold=0.8, 
-                 pdb_sdf_path=None, lig_list_path=None, pdb_clust_path=None, 
-                 mirror_path=None, molprobity_path=None):
+                 lig_qual_threshold=None, pdb_sdf_path=None, 
+                 lig_list_path=None, lig_qual_path=None, 
+                 pdb_clust_path=None, mirror_path=None, molprobity_path=None):
         self.smarts = smarts
         self.discard = discard
         self.metals = metals
@@ -97,6 +98,10 @@ class PDBSmarts:
             pdb_clust = pdb_clust_path
         if mirror_path:
             mirror = mirror_path
+        if lig_qual_path:
+            lig_qual_df = pd.read_csv(lig_qual_path)
+        else:
+            lig_quality_df = pd.DataFrame()
         self.molprobity_path = molprobity_path
         # read ligand list file
         with open(lig_list, 'r') as f:
@@ -108,7 +113,6 @@ class PDBSmarts:
         suppl = Chem.SDMolSupplier(pdb_sdf, removeHs=False)
         mols = []
         names = []
-        pdbs = []
         for mol in suppl:
             if mol is not None:
                 Chem.SanitizeMol(mol)
@@ -116,10 +120,27 @@ class PDBSmarts:
                         ExactMolWt(mol) < lig_weight_limit:
                     names.append(mol.GetProp("_Name"))
                     mols.append(mol)
-        # get list of PDBs containing each ligand in dict form
-        pdbs = dict([(lig, plist.split()) for lig, plist in 
-                     [line.split('\t') for line in lines] 
-                     if lig in names])
+        if len(lig_qual_df) and lig_qual_threshold is not None: 
+            # get list of PDBs containing high-quality ligands
+            lig_rows = lig_qual_df[lig_qual_df['ligand_name'].isin(names)]
+            lig_rows.reset_index(inplace=True)
+            lq_float = np.array([float(val[:-1]) / 100. for val in 
+                                 lig_rows['quality']])
+            good_idx = np.argwhere(lq_float > 
+                                   lig_qual_threshold).flatten()
+            hi_qual_pdbs = set(pdb.lower() for pdb in 
+                               lig_rows.iloc[good_idx]['pdb_accession'])
+            lig_lines = [(lig, plist.split()) for lig, plist in 
+                         [line.split('\t') for line in lines] 
+                         if lig in names]
+            pdbs = dict([(lig, list(hi_qual_pdbs.intersection(plist))) 
+                         for lig, plist in lig_lines])
+        else:
+            # get list of PDBs containing each ligand in dict form
+            lig_lines = [(lig, plist.split()) for lig, plist in 
+                         [line.split('\t') for line in lines] 
+                         if lig in names]
+            pdbs = dict(lig_lines) 
         # get list of PDBs containing each SMARTS pattern in dict form
         self.match_mols = {}
         self.match_pdbs = {}
@@ -183,8 +204,8 @@ class PDBSmarts:
                       self.match_mols[smarts_str][0].GetProp("_Name"))
 
     def read_matches(self, smarts_str, discard=False, metals=None,  
-                     res_cutoff=2., robs_cutoff=0.3, molprobity_cutoff=2., 
-                     threads=1, save_memory=True):
+                     res_cutoff=2., robs_cutoff=0.3, lig_quality_cutoff=0.5, 
+                     molprobity_cutoff=2., threads=1, save_memory=True):
         nmols = len(self.match_mols[smarts_str])
         match_mols = \
             iterchain.from_iterable([[self.match_mols[smarts_str][i]] * 
@@ -197,8 +218,8 @@ class PDBSmarts:
             pool = multiprocessing.Pool(threads)
             self._dfs[smarts_str] = list(pool.imap(worker, 
                 ((match_pdb, res_cutoff, robs_cutoff, match_mol, smarts_str, 
-                discard, metals, ref_coords, self._perms[smarts_str]) 
-                for match_pdb, match_mol in zip(match_pdbs, match_mols))))
+                discard, metals, ref_coords, self._perms[smarts_str]) for 
+                match_pdb, match_mol in zip(match_pdbs, match_mols))))
         else:
             self._dfs[smarts_str] = []
             for match_pdb, match_mol in zip(match_pdbs, match_mols):
@@ -459,7 +480,11 @@ class LigandPDB:
             lines = f.readlines()
         for num in self._resnums:
             lig_sel = 'resnum {}'.format(num)
-            lig_atoms = self._atoms.select(lig_sel)
+            try:
+                lig_atoms = self._atoms.select(lig_sel)
+            except:
+                self._resnums = [n for n in self._resnums if n != num]
+                continue
             prot_sel = 'protein within 5 of ' + lig_sel
             if metals:
                 metals_or = ' or resname '.join(metals)
@@ -561,6 +586,7 @@ class LigandPDB:
                 else:
                     idxs = np.array(idxs)
                 pos = np.round(mol.GetConformers()[0].GetPositions(), 3)
+                # pos = mol.GetConformers()[0].GetPositions()
                 n_array = np.array(mol_names)[idxs]
                 # find best alignment of pos to ref_coords
                 if ref_coords is not None and perms is not None:
@@ -568,6 +594,8 @@ class LigandPDB:
                     mean_ref = np.mean(ref_coords, axis=0)
                     min_rmsd = np.inf
                     min_perm = perms[0]
+                    assert len(pos) >= len(idxs)
+                    assert len(pos) >= len(min_perm)
                     for p in perms:
                         rot, rmsd = Rotation.align_vectors(
                             pos[idxs][p] - mean_pos, ref_coords - mean_ref)
@@ -600,6 +628,17 @@ def parse_args():
                       "(Default: 1000 Daltons)")
     argp.add_argument('--tanimoto', type=float, default=1., 
                       help="Cluster threshold by which to cluster ligands.")
+    argp.add_argument('-p', '--lig-quality-path', type=os.path.realpath, 
+                      help="Path to ligand quality file generated by the "
+                      "fetch_ligand_quality.py script, if desired.")
+    argp.add_argument('-q', '--min-lig-quality', type=float, help="Minimum "
+                      "ligand quality percent to include in matched "
+                      "PDB structures.")
+    argp.add_argument('--max-robs', default=0.3, type=float, help="Maximum "
+                      "R_obs value to include in matched PDB structures.")
+    argp.add_argument('--max-res', default=2, type=float, help="Maximum "
+                      "resolution (in Angstroms) to include in matched "
+                      "PDB structures.")
     args = argp.parse_args()
     return args
     
@@ -607,11 +646,16 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
     pdb_smarts = PDBSmarts(args.smarts, args.discard, args.metals, None,  
-                           args.weight_limit, args.tanimoto)
+                           args.weight_limit, args.tanimoto, 
+                           args.min_lig_quality, 
+                           lig_qual_path=args.lig_quality_path)
     for smarts in pdb_smarts.smarts:
         pdb_smarts.count_pdbs(smarts)
         if not args.dryrun:
             pdb_smarts.read_matches(smarts, discard=args.discard, 
-                                    metals=args.metals, threads=args.threads)
+                                    metals=args.metals, 
+                                    res_cutoff=args.max_res, 
+                                    robs_cutoff=args.max_robs, 
+                                    threads=args.threads)
             pdb_smarts.write_combs_csv(smarts)
             pdb_smarts.count_pdbs(smarts)
