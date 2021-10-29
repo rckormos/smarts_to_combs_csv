@@ -1,11 +1,13 @@
 import os
 import sys
 import gzip
+import signal
 import shutil
 import argparse
 import multiprocessing
 
 from io import StringIO
+from contextlib import contextmanager
 from itertools import chain as iterchain
 from itertools import permutations as permute
 
@@ -21,6 +23,19 @@ from prody import *
 from scipy.spatial.transform import Rotation
 
 RDLogger.DisableLog('rdApp.*')
+
+class TimeoutException(Exception): pass
+
+@contextmanager
+def time_limit(seconds):
+    def signal_handler(signum, frame):
+        raise TimeoutException()
+    signal.signal(signal.SIGALRM, signal_handler)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
 
 def worker(tup):
     ligpdb, res_cutoff, robs_cutoff, ref_mol, \
@@ -383,10 +398,12 @@ class LigandPDB:
         self._header = None
         self.resolution = None
         self.r_obs = None
-        if not os.path.exists(self.pdb_path):
+        try:
+            with time_limit(15):
+                asym, self._header = parsePDB(self.pdb_path, header=True)
+        except:
             self.removed = True
             return
-        asym, self._header = parsePDB(self.pdb_path, header=True)
         with gzip.open(self.pdb_path, 'rt') as f:
             lines = f.read().split('\n')
         if 'resolution' in self._header.keys():
