@@ -1,0 +1,23 @@
+#!/bin/bash
+
+#$ -S /bin/bash
+#$ -cwd
+#$ -r y
+#$ -j y
+#$ -pe smp 12
+#$ -l mem_free=1G
+#$ -l h_rt=08:00:00
+
+export OMP_NUM_THREADS=${NSLOTS:-1}
+
+date
+hostname
+
+conda activate env_rdkit
+
+export SMARTS=$1
+
+python /wynton/home/rotation/rkormos/thesis_project/smarts_to_combs_csv/smarts_to_combs_csv.py $SMARTS -w 1000 --tanimoto 0.7 -p /wynton/home/rotation/rkormos/thesis_project/smarts_to_combs_csv/lig_quality.csv -q 0.5 --max-robs 0.3 --max-res 2.5 -t ${NSLOTS:-1} 
+
+qstat -j $JOB_ID                                  # This is useful for debugging and usage purposes,
+                                                  # e.g. "did my job exceed its memory request?"

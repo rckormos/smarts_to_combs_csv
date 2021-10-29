@@ -23,14 +23,12 @@ from scipy.spatial.transform import Rotation
 RDLogger.DisableLog('rdApp.*')
 
 def worker(tup):
-    ligpdb, res_cutoff, robs_cutoff, match_mol, \
+    ligpdb, res_cutoff, robs_cutoff, ref_mol, \
         smarts_str, discard, metals, ref_coords, perms = tup
     ligpdb.read_pdb()
     if not ligpdb.removed and (ligpdb.resolution > res_cutoff
             or ligpdb.r_obs > robs_cutoff):
         return None
-    ref_mol = \
-        Chem.rdmolops.RemoveHs(match_mol)
     ligpdb.set_dataframe(smarts_str, discard, metals, 
                          ref_coords, ref_mol, perms)
     return ligpdb.dataframe
@@ -80,14 +78,14 @@ class PDBSmarts:
         self.metals = metals
         self.workdir = os.getcwd()
         # http://ligand-expo.rcsb.org/dictionaries/cc-to-pdb.tdd
-        lig_list = '/Users/kormos/smarts_to_combs_csv/cc-to-pdb.tdd'
+        lig_list = '/wynton/home/rotation/rkormos/thesis_project/smarts_to_combs_csv/cc-to-pdb-prot.tdd'
         # http://ligand-expo.rcsb.org/dictionaries/Components-pub.sdf
-        pdb_sdf = '/Users/kormos/smarts_to_combs_csv/Components-pub.sdf'
+        pdb_sdf = '/wynton/home/rotation/rkormos/thesis_project/smarts_to_combs_csv/Components-pub-prot.sdf'
         # https://cdn.rcsb.org/resources/sequence/clusters/bc-50.out
-        pdb_clust = '/Users/kormos/smarts_to_combs_csv/bc-50.out'
+        pdb_clust = '/wynton/home/rotation/rkormos/thesis_project/smarts_to_combs_csv/bc-50.out'
         # rsync -rlpt -v -z --delete --port=33444 
         # rsync.rcsb.org::ftp_data/structures/divided/pdb/ <DEST FOLDER>
-        mirror = '/Users/kormos/pdb'
+        mirror = '/wynton/home/rotation/rkormos/pdb'
         if workdir:
             self.workdir = workdir
         if lig_list_path:
@@ -120,9 +118,10 @@ class PDBSmarts:
                         ExactMolWt(mol) < lig_weight_limit:
                     names.append(mol.GetProp("_Name"))
                     mols.append(mol)
-        if len(lig_qual_df) and lig_qual_threshold is not None: 
+        basenames = [name.split('_')[0] for name in names]
+        if len(lig_qual_df) and lig_qual_threshold is not None:
             # get list of PDBs containing high-quality ligands
-            lig_rows = lig_qual_df[lig_qual_df['ligand_name'].isin(names)]
+            lig_rows = lig_qual_df[lig_qual_df['ligand_name'].isin(basenames)]
             lig_rows.reset_index(inplace=True)
             lq_float = np.array([float(val[:-1]) / 100. for val in 
                                  lig_rows['quality']])
@@ -176,11 +175,22 @@ class PDBSmarts:
             sym_classes = np.array(Chem.CanonicalRankAtoms(patt, 
                                                            breakTies=False))
             dt = np.dtype([('', np.int64)] * n_atoms)
-            perms = np.fromiter(permute(np.arange(n_atoms)), 
-		                dt).view(np.int64).reshape(-1, n_atoms)
-            sym_perms = sym_classes[perms]
-            self._perms[smarts_str] = \
-                perms[np.all(sym_perms == sym_perms[0], axis=1)]
+            perms_iter = permute(np.arange(n_atoms))
+            n_perms = np.math.factorial(n_atoms)
+            relevant_perms = []
+            for i in range(n_perms // 1000000 + 1): # memory-efficient
+                if i == n_perms // 1000000:
+                    count = n_perms % 1000000
+                else:
+                    count = 1000000
+                perms = np.fromiter(perms_iter, dt, 
+                                    count).view(np.int64).reshape(-1, n_atoms)
+                sym_perms = sym_classes[perms]
+                if not len(relevant_perms):
+                    sym_perm_0 = sym_perms[0]
+                relevant_perms.append(
+                    perms[np.all(sym_perms == sym_perm_0, axis=1)])
+            self._perms[smarts_str] = np.vstack(relevant_perms)
         self._dfs = {}
         self._final_df = {}
 
@@ -288,7 +298,8 @@ class PDBSmarts:
         self._final_df[smarts_str] = df
 
     def set_tanimoto_clusters(self, smarts_str, tanimoto_threshold):
-        names = [mol.GetProp("_Name") for mol in self.match_mols[smarts_str]]
+        names = [mol.GetProp("_Name").split('_')[0] for mol in 
+                 self.match_mols[smarts_str]]
         if tanimoto_threshold == 1.:
             self._tanimoto_clusters[smarts_str] = [[name] for name in names]
             return
@@ -357,7 +368,10 @@ class LigandPDB:
     """
     def __init__(self, pdb_id, mirror_dir, ligname, pdb_clust):
         self.id = pdb_id
-        self.ligname = ligname
+        if '_' not in ligname:
+            self.ligname = ligname
+        else:
+            self.ligname = ligname[:ligname.index('_')]
         self.removed = False
         self._mirror = mirror_dir
         self._pdb_clust = pdb_clust
@@ -549,6 +563,10 @@ class LigandPDB:
         self._coords = []
         for i, num in enumerate(self._resnums):
             selstr = 'resnum {} and resname {} and chain {} and segindex {}'
+            # print('pdb =', self.pdb_path) 
+            # print('selstr =', selstr.format(num, self.ligname, 
+            #                                 self._lig_chains[i], 
+            #                                 self._lig_segi[i]))
             sel = self._atoms.select(selstr.format(num, self.ligname, 
                                                    self._lig_chains[i], 
                                                    self._lig_segi[i]))
@@ -559,19 +577,16 @@ class LigandPDB:
             pdbio = StringIO()
             writePDBStream(pdbio, sel)
             block = pdbio.getvalue()
-            # not all ligands have hydrogen, so MolFromPDBBlock removes any H 
-            # if it happens to be present, and then H is added back by RDKit
-            mol = Chem.rdmolfiles.MolFromPDBBlock(block)
+            hetatm_lines = '\n'.join([line for line in block.split('\n') 
+                                      if 'HETATM' in line]) + '\n'
+            mol = Chem.rdmolfiles.MolFromPDBBlock(block, removeHs=False)
             try:
-                if ref_mol is not None and mol.GetNumAtoms() == \
-                        ref_mol.GetNumAtoms():
-                    mol = AllChem.AssignBondOrdersFromTemplate(ref_mol, mol)
+                mol = AllChem.AssignBondOrdersFromTemplate(ref_mol, mol)
             except:
                 self._resnums = [n for n in self._resnums if n != num]
                 continue
-            mol = Chem.rdmolops.AddHs(mol, addCoords=True)
             mol_names = []
-            for line in Chem.rdmolfiles.MolToPDBBlock(mol).split('\n'):
+            for line in hetatm_lines.split('\n'):
                 mol_names.append(line[12:16].strip())
             patt = Chem.MolFromSmarts(smarts)
             idxs_tup = mol.GetSubstructMatches(patt)
