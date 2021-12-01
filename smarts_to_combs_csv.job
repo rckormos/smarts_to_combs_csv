@@ -4,7 +4,7 @@
 #$ -cwd
 #$ -r y
 #$ -j y
-#$ -pe smp 12
+#$ -pe smp 4
 #$ -l mem_free=1G
 #$ -l h_rt=08:00:00
 

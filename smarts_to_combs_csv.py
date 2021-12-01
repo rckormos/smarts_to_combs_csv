@@ -22,6 +22,8 @@ from rdkit import RDLogger
 from prody import *
 from scipy.spatial.transform import Rotation
 
+from copy import deepcopy
+
 RDLogger.DisableLog('rdApp.*')
 
 class TimeoutException(Exception): pass
@@ -114,7 +116,7 @@ class PDBSmarts:
         if lig_qual_path:
             lig_qual_df = pd.read_csv(lig_qual_path)
         else:
-            lig_quality_df = pd.DataFrame()
+            lig_qual_df = pd.DataFrame()
         self.molprobity_path = molprobity_path
         # read ligand list file
         with open(lig_list, 'r') as f:
@@ -189,23 +191,28 @@ class PDBSmarts:
             patt.UpdatePropertyCache()
             sym_classes = np.array(Chem.CanonicalRankAtoms(patt, 
                                                            breakTies=False))
-            dt = np.dtype([('', np.int64)] * n_atoms)
-            perms_iter = permute(np.arange(n_atoms))
-            n_perms = np.math.factorial(n_atoms)
-            relevant_perms = []
-            for i in range(n_perms // 1000000 + 1): # memory-efficient
-                if i == n_perms // 1000000:
-                    count = n_perms % 1000000
-                else:
-                    count = 1000000
-                perms = np.fromiter(perms_iter, dt, 
-                                    count).view(np.int64).reshape(-1, n_atoms)
-                sym_perms = sym_classes[perms]
-                if not len(relevant_perms):
-                    sym_perm_0 = sym_perms[0]
-                relevant_perms.append(
-                    perms[np.all(sym_perms == sym_perm_0, axis=1)])
-            self._perms[smarts_str] = np.vstack(relevant_perms)
+            if len(sym_classes) == len(np.unique(sym_classes)):
+                self._perms[smarts_str] = \
+                    np.arange(n_atoms).reshape(-1, n_atoms)
+            else:
+                dt = np.dtype([('', np.int64)] * n_atoms)
+                perms_iter = permute(np.arange(n_atoms))
+                n_perms = np.math.factorial(n_atoms)
+                relevant_perms = []
+                group_size = 10000000
+                for i in range(n_perms // group_size + 1): # memory-efficient
+                    if i == n_perms // group_size:
+                        count = n_perms % group_size
+                    else:
+                        count = group_size
+                    perms = np.fromiter(perms_iter, dt, count).view(
+                        np.int64).reshape(-1, n_atoms)
+                    sym_perms = sym_classes[perms]
+                    if not len(relevant_perms):
+                        sym_perm_0 = sym_perms[0]
+                    relevant_perms.append(
+                        perms[np.all(sym_perms == sym_perm_0, axis=1)])
+                self._perms[smarts_str] = np.vstack(relevant_perms)
         self._dfs = {}
         self._final_df = {}
 
@@ -598,7 +605,8 @@ class LigandPDB:
                                       if 'HETATM' in line]) + '\n'
             mol = Chem.rdmolfiles.MolFromPDBBlock(block, removeHs=False)
             try:
-                mol = AllChem.AssignBondOrdersFromTemplate(ref_mol, mol)
+                mol = assign_bond_orders_from_template(ref_mol, mol)
+                # print('Bond order assignment succeeded!')
             except:
                 self._resnums = [n for n in self._resnums if n != num]
                 continue
@@ -639,6 +647,84 @@ class LigandPDB:
                 else:
                     self._names.append(list(n_array))
                     self._coords.append(pos[idxs]) 
+
+
+def assign_bond_orders_from_template(template, mol):
+    '''Assign bond orders to mol from template if one is substruct of another.
+
+    Parameters
+    ----------
+    template : rdkit.Chem.rdchem.Mol
+        The molecule object from which to extract bond orders.
+        Can be a substructure or superstructure of mol.
+    mol : rdkit.Chem.rdchem.Mol
+        The molecule object to which to assign bond orders, assumed to 
+        have all single bond orders.
+
+    Returns
+    -------
+    assigned_mol : rdkit.Chem.rdchem.Mol
+        The molecule object with reassigned bond orders.
+    '''
+    if mol.HasSubstructMatch(template):
+        assigned_mol = AllChem.AssignBondOrdersFromTemplate(template, mol)
+        return assigned_mol
+    mol_noH = Chem.RemoveHs(mol)
+    mol_Hmatch = invert_substruct_match(mol.GetSubstructMatch(mol_noH), 
+                                        mol.GetNumAtoms()) + (-1,)
+    template_noH = Chem.RemoveHs(template)
+    template_singleb = deepcopy(template_noH)
+    for b in mol_noH.GetBonds():
+        b.SetBondType(Chem.BondType.SINGLE)
+    for b in template_singleb.GetBonds():
+        b.SetBondType(Chem.BondType.SINGLE)
+    if mol_noH.HasSubstructMatch(template_singleb):
+        match = mol_noH.GetSubstructMatch(template_singleb)
+    elif template_singleb.HasSubstructMatch(mol_noH):
+        match = invert_substruct_match(
+            template_singleb.GetSubstructMatch(mol_noH), 
+            template_singleb.GetNumAtoms())
+    else:
+        raise ValueError('One input is not a substruct of the other.')
+    assigned_mol = deepcopy(mol)
+    for b in template_noH.GetBonds():
+        a1 = b.GetBeginAtomIdx()
+        a2 = b.GetEndAtomIdx()
+        a1m = mol_Hmatch[match[a1]]
+        a2m = mol_Hmatch[match[a2]]
+        try:
+            mol_b = assigned_mol.GetBondBetweenAtoms(a1m, a2m)
+            mol_b.SetBondType(b.GetBondType())
+        except:
+            pass
+    return assigned_mol
+
+def invert_substruct_match(match, n_atoms):
+    '''Get the inverse mapping of a substructure match.
+
+    Parameters
+    ----------
+    match : tuple
+        Tuple of atom indices in a mol corresponding to zero-indexed 
+        atoms of a substructure mol.
+    n_atoms : int
+        Number of atoms in mol.
+
+    Returns
+    -------
+    inv_match : tuple
+        Tuple of atom indices in the substructure corresponding to 
+        zero-indexed atoms in the original mol.  Atoms in the mol 
+        without matches in the substructure are assigned -1.
+    '''
+    inv_match = []
+    for i in range(n_atoms):
+        if i in match:
+            inv_match.append(match.index(i))
+        else:
+            inv_match.append(-1)
+    inv_match = tuple(inv_match)
+    return inv_match
 
 
 def parse_args():
